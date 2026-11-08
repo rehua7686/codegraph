@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- In C#, Kotlin, Scala, Dart, VB.NET and Solidity, a call that fits several overloads by its number of arguments now links to one of those, like `KUtil.load(f, c, b, p)` between two four-parameter `load` overloads. Before, it went to the first overload declared even when that one takes a different number of parameters, and a method calling another overload of itself, like `Read(value, null)` inside `Read(string value)`, could link back to itself. Thanks @inth3shadows for the report. (#3040)
 
 ## [1.6.4] - 2026-11-20
 
