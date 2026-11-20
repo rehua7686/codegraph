@@ -5301,6 +5301,13 @@ export class QueryBuilder {
       .all() as Array<{ key: string }>).map((row) => row.key);
   }
 
+  /** Owner-dependent calls parked until a TypeScript declaration changes. */
+  getFailedInstanceTypeOwnerKeys(): string[] {
+    return (this.db
+      .prepare(`SELECT DISTINCT name_tail AS key FROM unresolved_refs WHERE status = 'failed' AND name_tail GLOB 'module:type-owner:*'`)
+      .all() as Array<{ key: string }>).map((row) => row.key);
+  }
+
   /**
    * Put failed refs back in the pending set, for the next resolution pass —
    * the sync's orphan sweep — to try again. Returns the number re-opened.
@@ -5692,6 +5699,21 @@ export class QueryBuilder {
           WHERE e.metadata LIKE '%"typeFrom"%'`
       )
       .all() as Array<EdgeRow & { source_file_path: string; source_language: Language }>;
+    return rows.map((row) => ({
+      ...rowToEdge(row),
+      edgeId: row.id,
+      sourceFilePath: row.source_file_path,
+      sourceLanguage: row.source_language,
+    }));
+  }
+
+  /** Resolved instance-result calls that depend on a type's declaration set, via the partial owner index. */
+  getEdgesWithInstanceTypeOwner(): Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }> {
+    const rows = this.db.prepare(
+      `SELECT e.*, src.file_path AS source_file_path, src.language AS source_language
+         FROM edges e JOIN nodes src ON src.id = e.source
+        WHERE e.metadata LIKE '%"instanceTypeOwner"%'`
+    ).all() as Array<EdgeRow & { source_file_path: string; source_language: Language }>;
     return rows.map((row) => ({
       ...rowToEdge(row),
       edgeId: row.id,

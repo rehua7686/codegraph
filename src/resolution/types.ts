@@ -32,6 +32,12 @@ export interface UnresolvedRef {
   /** The tail a ref that failed to resolve is parked under, when it is not
    * the one its name gives (see `importBindingTail`). */
   nameTail?: string;
+  /** Type whose instance member supplies a local call result, for sync invalidation. */
+  instanceTypeOwner?: string;
+  /** The instance result was declined because its owner has merged declarations. */
+  instanceTypeMerged?: boolean;
+  /** An imported factory result could become inferable when its declarations change. */
+  instanceTypePending?: string;
 }
 
 /**

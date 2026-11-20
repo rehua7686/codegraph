@@ -23,7 +23,7 @@ import { cppClassWritten, type CppNameSite } from './cpp-supertypes';
 import { cppIncludedFile, cppIncludedHeadersBeside, cppIncluders } from './cpp-includers';
 import { isCFeatureVariant, isOffByDefault } from './c-feature-variants';
 import { isTestFile, isTestPath } from '../search/query-utils';
-import { ambientModuleDeclarations, declaringFileAnswers, inBlock, isDeclarationFile, isMergedAmbientDeclaration, scanGlobalScope, type GlobalScopeScan } from './ambient-modules';
+import { ambientModuleDeclarations, declaringFileAnswers, inBlock, isDeclarationFile, isMergedAmbientDeclaration, namespaceBlocks, scanGlobalScope, type GlobalScopeScan } from './ambient-modules';
 import { leavesWorkspaceRoot } from './workspace-packages';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap, parsePackageName, parseTargetPaths, parseWorkspaceMembers } from './frameworks/cargo-workspace';
@@ -23998,6 +23998,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   TS_NAMED_CLASSES.delete(context);
   TS_AMBIENT_MODULE_FILES.delete(context);
   TS_GLOBAL_SCOPES.delete(context);
+  TS_INSTANCE_ALIAS_NAMES.delete(context);
   C_STATIC_MEMO.delete(context);
   CPP_TYPE_DECLS.delete(context);
   CPP_INCLUDE_LINES.delete(context);
@@ -25459,6 +25460,9 @@ interface JsBindingSite {
   reading?: JsBindingReading | null;
   /** What jsReceiverReadElsewhere reads for the binding, and where an assignment would start to matter. */
   elsewhere?: { read: JsReadElsewhere; from: number } | null;
+  instanceTypeOwner?: string;
+  instanceTypeMerged?: boolean;
+  instanceTypePending?: string;
   /** Where the binding's name is assigned within its extent (jsAssignedBetween), read once. */
   assigns?: number[];
 }
@@ -26521,13 +26525,24 @@ function jsReceiverReadElsewhere(name: string, ref: UnresolvedRef, context: Reso
   if (!site) return null;
   // Read once per binding: every call on it reads the same declaration.
   if (site.elsewhere === undefined) {
+    ref.instanceTypeOwner = undefined;
+    ref.instanceTypeMerged = undefined;
+    ref.instanceTypePending = undefined;
     const read = site.kind === 'declaration'
       ? (candidates.calls.has(name) ? jsCallResultReading(name, site, file, ref, context) : null)
       : (param ? jsCallbackParameterReading(name, site, file, ref, context) : null);
     site.elsewhere = read;
+    site.instanceTypeOwner = ref.instanceTypeOwner;
+    site.instanceTypeMerged = ref.instanceTypeMerged;
+    site.instanceTypePending = ref.instanceTypePending;
   }
   // An assignment between the binding and the call gives the receiver what it assigns, which this doesn't read.
   const known = site.elsewhere;
+  if (!known || !jsAssignedBetween(name, site, file, known.from, callAt)) {
+    ref.instanceTypeOwner = site.instanceTypeOwner;
+    ref.instanceTypeMerged = site.instanceTypeMerged;
+    ref.instanceTypePending = site.instanceTypePending;
+  }
   return known && !jsAssignedBetween(name, site, file, known.from, callAt) ? known.read : null;
 }
 
@@ -26725,16 +26740,19 @@ function tsReturnedTypeOf(fn: Node, context: ResolutionContext, walk: { depth: n
   if (depth !== 0) return null;
   const where: UnresolvedRef = { fromNodeId: fn.id, referenceName: fn.name, referenceKind: 'calls', line: fn.startLine, column: fn.startColumn, filePath: fn.filePath, language: fn.language };
   const read = tsValueType(file, bodyOpen + 1 + at + 'return'.length, where, context, walk, false);
+  // An inferred instance result depends on the owner's complete declaration
+  // set, which this function's cached return reading cannot track across sync.
+  if (where.instanceTypeOwner) return null;
   return read && { ...read, from: [...read.from, fn.filePath] };
 }
 
 /**
  * The type of the JS/TS value written at `at` in `file`, read the way the
  * checker infers it, where that is exact: a call of one project function
- * (jsCalledFunction) whose return type is read (tsReturnedType); a call of
- * a method that returns its one argument (`disposables.add(x)`, its
- * declaration `add<T>(o: T): T`, on a receiver its binding types) as that
- * argument's; `new X()` of a class the file names. Each is the whole value.
+ * (jsCalledFunction) whose return type is read (tsReturnedType); an instance
+ * call with one declared return type; a method that returns its one argument
+ * (`disposables.add(x)`, declared as `add<T>(o: T): T`); or `new X()` of a
+ * class the file names. Each is the whole value.
  * `where` locates `file` for its imports. A `new` is no answer at the top
  * (`top`), where the declaration's own reader has it.
  */
@@ -26774,7 +26792,6 @@ function tsValueType(file: JsScopeFile, at: number, where: UnresolvedRef, contex
     const read = fn ? tsReturnedType(fn, context, walk) : null;
     return read && { ...read, from: [...read.from, fn!.filePath] };
   }
-  // `recv.w(x)`: w's declaration returns its one argument, on the class recv's binding types.
   if (head === 'this' || head === 'super') return null;
   const site = jsBindingAt(head!, file, at);
   // `Class.factory(x)`, with nothing in scope binding the class's name: what
@@ -26785,14 +26802,249 @@ function tsValueType(file: JsScopeFile, at: number, where: UnresolvedRef, contex
     const read = tsStaticReturnedType(cls, member!, where, context);
     return read && { ...read, from: [...read.from, cls.filePath] };
   }
-  const reading = site ? jsBindingReading(head!, site, file) : null;
-  const owner = reading ? tsNamedType(reading.raw.replace(/\s*<[\s\S]*$/, ''), { filePath: where.filePath, language: where.language, id: '' }, where, context) : null;
-  if (!owner || owner === 'outside' || owner.kind !== 'class') return null;
-  const methods = tsClassMethods(owner, member!, where, context, 0);
-  const args = tsTopLevelParts(code.slice(open + 1, close));
-  if (methods.length !== 1 || !tsReturnsItsArgument(methods[0]!, context) || !args || args.length !== 1) return null;
-  const inner = tsValueType(file, open + 1, where, context, walk, false);
-  return inner && { ...inner, from: [...inner.from, owner.filePath, methods[0]!.filePath] };
+  if (!site) {
+    const mapping = context.getImportMappings(where.filePath, where.language).find((item) => item.localName === head);
+    if (!mapping || mapping.isNamespace || context.isOutOfRepoImport?.(mapping.source, where.filePath, where.language)) return null;
+    const resolved = context.resolveImport?.({ ...where, referenceName: head!, referenceKind: 'references' });
+    const constant = resolved && context.getNodeById?.(resolved.targetNodeId);
+    if (!constant || (constant.kind !== 'constant' && constant.kind !== 'variable') ||
+        (constant.language !== 'typescript' && constant.language !== 'tsx')) return null;
+    const declaration = jsScopeFile(constant.filePath, context);
+    if (!declaration) return null;
+    const retry = (): null => {
+      where.instanceTypePending = constant.name;
+      return null;
+    };
+    const start = (declaration.lineStarts[constant.startLine - 1] ?? declaration.code.length) + constant.startColumn;
+    const initializer = new RegExp(`^${escapeRegExp(constant.name)}\\s*=\\s*`).exec(declaration.code.slice(start));
+    if (!initializer || constant.kind !== 'constant') return retry();
+    const origin: UnresolvedRef = { ...where, filePath: constant.filePath, language: constant.language, instanceTypeOwner: undefined, instanceTypeMerged: undefined, instanceTypePending: undefined };
+    const valueAt = start + initializer[0].length;
+    if (walk.depth >= TS_VALUE_DEPTH) {
+      walk.capped = true;
+      return retry();
+    }
+    walk.depth++;
+    let value: TsTypeRead | null;
+    try {
+      value = tsValueType(declaration, valueAt, origin, context, walk, false) ??
+        tsConstArrowFactoryReturn(declaration, valueAt, origin, context);
+    } finally {
+      walk.depth--;
+    }
+    // An instance result read inside the initializer has its own sync
+    // dependency, which this outer reading cannot carry independently.
+    if (!value || origin.instanceTypeOwner || origin.instanceTypePending || value.raw.split('<')[0]!.includes('.')) return retry();
+    const written = value.raw.replace(/\s*<[\s\S]*$/, '');
+    const typeSite: UnresolvedRef = { ...where, filePath: value.file, language: value.language, instanceTypeOwner: undefined, instanceTypeMerged: undefined, instanceTypePending: undefined };
+    const owner = tsNamedType(written, { filePath: value.file, language: value.language, id: '' }, typeSite, context);
+    if (owner === 'outside') return retry();
+    const read = tsInstanceReturnedType(owner, written, member!, typeSite, context);
+    where.instanceTypeOwner = typeSite.instanceTypeOwner;
+    where.instanceTypeMerged = typeSite.instanceTypeMerged;
+    if (!read && !typeSite.instanceTypeMerged) return retry();
+    return read && { ...read, from: [...read.from, ...value.from, constant.filePath] };
+  }
+  const reading = jsBindingReading(head!, site, file);
+  if (!reading) return null;
+  if (reading.raw.trim().endsWith(']')) return null;
+  const written = reading.raw.replace(/\s*<[\s\S]*$/, '');
+  const owner = tsNamedType(written, { filePath: where.filePath, language: where.language, id: '' }, where, context);
+  if (owner === 'outside') return null;
+  if (owner?.kind === 'class') {
+    const methods = tsClassMethods(owner, member, where, context, 0);
+    if (methods.length === 1 && tsReturnsItsArgument(methods[0]!, context)) {
+      const args = tsTopLevelParts(code.slice(open + 1, close));
+      if (!args || args.length !== 1) return null;
+      const inner = tsValueType(file, open + 1, where, context, walk, false);
+      return inner && { ...inner, from: [...inner.from, owner.filePath, methods[0]!.filePath] };
+    }
+  }
+  // The binding reader may have read just the first arm of a compound type.
+  const binding = new RegExp(`^(?:(?:const|let|var)\\s+)?${escapeRegExp(head!)}\\s*[?!]?\\s*:\\s*${escapeRegExp(reading.raw)}\\s*[|&\\[<]`);
+  if (binding.test(code.slice(site.at, site.at + 400))) return null;
+  return tsInstanceReturnedType(owner, written, member, where, context);
+}
+
+/** A constant initialized by a call to one non-generic, explicitly typed arrow. */
+function tsConstArrowFactoryReturn(file: JsScopeFile, at: number, where: UnresolvedRef, context: ResolutionContext): TsTypeRead | null {
+  const call = /^\s*([A-Za-z_$][\w$]*)\s*\(/.exec(file.code.slice(at, at + 300));
+  if (!call) return null;
+  const open = at + call[0].length - 1;
+  const close = jsCloseOf(file.code, open);
+  if (close < 0 || !JS_WHOLE_VALUE_END.test(file.code.slice(close + 1, close + 200))) return null;
+  const site = jsBindingAt(call[1]!, file, open);
+  if (!site || site.kind !== 'declaration') return null;
+  const declaration = new RegExp(`^const\\s+${escapeRegExp(call[1]!)}\\s*=\\s*\\(`);
+  const head = declaration.exec(file.code.slice(site.at, site.at + 300));
+  if (!head) return null;
+  const line = jsLineOf(file, site.at);
+  const nodes = context.getNodesInFile(where.filePath).filter((node) =>
+    node.kind === 'function' && node.name === call[1] && node.startLine === line);
+  if (nodes.length !== 1) return null;
+  const fn = nodes[0]!;
+  if ((file.lineStarts[fn.startLine - 1] ?? file.code.length) + fn.startColumn !== site.at + head[0].length - 1) return null;
+  const signature = stripCommentsForRegex(fn.signature ?? '', 'typescript').trim();
+  return tsDeclaredMemberReturn(fn, undefined, signature, ':', context);
+}
+
+/** A directly declared instance method or function-typed property (#3422). */
+function tsInstanceReturnedType(
+  owner: Node | null, written: string, name: string, at: UnresolvedRef, context: ResolutionContext,
+): TsTypeRead | null {
+  if (!owner) {
+    const mapping = context.getImportMappings?.(at.filePath, at.language)?.find((i) => i.localName === written.split('.')[0]);
+    if (mapping) {
+      const imported = context.resolveImport?.({ ...at, referenceName: written, referenceKind: 'references' });
+      const target = imported && context.getNodeById?.(imported.targetNodeId);
+      if (target?.kind === 'type_alias') owner = target;
+    } else {
+      const aliases = context.getNodesInFile(at.filePath).filter((n) => n.kind === 'type_alias' && n.name === written);
+      owner = aliases.length === 1 ? aliases[0]! : null;
+    }
+  }
+  if (owner?.language !== 'typescript' && owner?.language !== 'tsx') return null;
+  if (owner.kind === 'class' || owner.kind === 'interface') at.instanceTypeOwner = owner.name;
+  if (owner.kind === 'type_alias') {
+    const aliasName = owner.name;
+    if (context.getNodesInFile(owner.filePath).filter((n) => n.kind === 'type_alias' && n.name === aliasName).length !== 1) return null;
+  }
+  if (owner.kind === 'type_alias' && !tsAliasIsObjectType(owner, context)) return null;
+  if (owner.kind !== 'type_alias' && tsOwnerHasMergedDeclarations(owner, context)) {
+    at.instanceTypeMerged = true;
+    return null;
+  }
+  const members = context.getNodesInFile(owner.filePath).filter((n) =>
+    n.qualifiedName === `${owner.qualifiedName}::${name}` && !n.isStatic &&
+    n.startLine >= owner.startLine && n.endLine <= owner.endLine &&
+    (n.kind === 'method' || n.kind === 'property' || n.kind === 'field'));
+  if (members.length !== 1) return null;
+  const member = members[0]!;
+  const signature = stripCommentsForRegex(member.signature ?? '', 'typescript').trim();
+  const file = jsScopeFile(member.filePath, context);
+  if (!file) return null;
+  const start = (file.lineStarts[member.startLine - 1] ?? file.code.length) + member.startColumn;
+  const head = new RegExp(`^(?:(?:public|protected|private|abstract|declare|override|async|readonly)\\s+)*${escapeRegExp(name)}\\s*\\??\\s*([(:])`);
+  const form = head.exec(file.code.slice(start, start + 300))?.[1];
+  if (form === '(') {
+    const methodSignature = signature.replace(new RegExp(`^(?:\\w+\\s+)*${escapeRegExp(name)}\\s*`), '');
+    const read = tsDeclaredMemberReturn(member, owner, methodSignature, ':', context);
+    return read && !read.raw.split('<')[0]!.includes('.') ? read : null;
+  }
+  if (form !== ':') return null;
+  const propertyHead = new RegExp(`^(?:\\w+\\s+)*${escapeRegExp(name)}\\s*\\??\\s*:\\s*`);
+  const callable = propertyHead.test(signature)
+    ? signature.replace(propertyHead, '')
+    : signature.replace(new RegExp(`\\s+${escapeRegExp(name)}\\s*\\??$`), '');
+  const read = tsDeclaredMemberReturn(member, owner, callable, '=>', context);
+  return read && !read.raw.split('<')[0]!.includes('.') ? read : null;
+}
+
+const TS_INSTANCE_ALIAS_NAMES = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
+
+/**
+ * Names connected by TypeScript import and export renames. This deliberately
+ * over-approximates across modules: an unrelated rename may cost an edge, but
+ * cannot make an augmented declaration look unambiguous.
+ */
+export function tsRelatedInstanceTypeNames(names: readonly string[], context: ResolutionContext): string[] {
+  let aliases = TS_INSTANCE_ALIAS_NAMES.get(context);
+  if (!aliases) {
+    aliases = new Map<string, Set<string>>();
+    const add = (a: string, b: string): void => {
+      if (a === b) return;
+      if (!aliases!.has(a)) aliases!.set(a, new Set());
+      if (!aliases!.has(b)) aliases!.set(b, new Set());
+      aliases!.get(a)!.add(b);
+      aliases!.get(b)!.add(a);
+    };
+    for (const file of context.getAllFiles()) {
+      if (!/\.[cm]?tsx?$/.test(file)) continue;
+      const source = context.scanFile?.(file) ?? context.readFile(file);
+      if (!source || !/\bas\b/.test(source)) continue;
+      for (const mapping of context.getImportMappings(file, 'typescript')) {
+        if (!mapping.isDefault && !mapping.isNamespace) add(mapping.exportedName, mapping.localName);
+      }
+      for (const entry of context.getReExports?.(file, 'typescript') ?? []) {
+        if (entry.kind === 'named') add(entry.originalName, entry.exportedName);
+      }
+      const clean = stripCommentsForRegex(source, 'typescript');
+      for (const clause of clean.matchAll(/\bexport\s+(?:type\s+)?\{([^{}]*)\}/g)) {
+        for (const item of clause[1]!.split(',')) {
+          const renamed = /^\s*(?:type\s+)?([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)\s*$/.exec(item);
+          if (renamed) add(renamed[1]!, renamed[2]!);
+        }
+      }
+    }
+    TS_INSTANCE_ALIAS_NAMES.set(context, aliases);
+  }
+  const found = new Set(names);
+  const pending = [...names];
+  for (let i = 0; i < pending.length; i++) {
+    for (const name of aliases.get(pending[i]!) ?? []) {
+      if (!found.has(name)) {
+        found.add(name);
+        pending.push(name);
+      }
+    }
+  }
+  return [...found];
+}
+
+function tsOwnerHasMergedDeclarations(owner: Node, context: ResolutionContext): boolean {
+  if (isMergedAmbientDeclaration(owner, context)) return true;
+  const ownerScope = tsGlobalScope(owner.filePath, context);
+  const ownerGlobal = ownerScope?.globalWords.has(`${owner.startLine}:${owner.startColumn}`) ?? false;
+  const ownerNamespaces = namespaceBlocks(owner.filePath, context).filter((block) => inBlock(owner, block));
+  for (const other of context.getNodesByName(owner.name)) {
+    if (other.id === owner.id || (other.kind !== 'class' && other.kind !== 'interface') ||
+        (other.language !== 'typescript' && other.language !== 'tsx')) continue;
+    if (other.filePath === owner.filePath && other.qualifiedName === owner.qualifiedName) return true;
+    const scope = tsGlobalScope(other.filePath, context);
+    if (!scope) return true;
+    if (ownerGlobal && scope.globalWords.has(`${other.startLine}:${other.startColumn}`)) return true;
+    // Namespace members' qualified names need not include their namespace.
+    // The same path in separate modules may be unrelated, so this is conservative.
+    if (ownerNamespaces.some((outer) =>
+      namespaceBlocks(other.filePath, context).some((block) => block.path === outer.path && inBlock(other, block)))) return true;
+    // A module augmentation may reach this declaration through a barrel that
+    // changes without touching the owner. Decline even for unrelated modules
+    // so that a barrel edit cannot leave a stale inferred edge behind.
+    if (scope.moduleBlocks.some((block) => !block.pattern && inBlock(other, block))) return true;
+  }
+  for (const name of tsRelatedInstanceTypeNames([owner.name], context)) {
+    if (name === owner.name) continue;
+    for (const other of context.getNodesByName(name)) {
+      if ((other.kind !== 'class' && other.kind !== 'interface') ||
+          (other.language !== 'typescript' && other.language !== 'tsx')) continue;
+      const scope = tsGlobalScope(other.filePath, context);
+      if (!scope || scope.moduleBlocks.some((block) => !block.pattern && inBlock(other, block))) return true;
+    }
+  }
+  return false;
+}
+
+function tsAliasIsObjectType(alias: Node, context: ResolutionContext): boolean {
+  const lines = (context.getFileLines?.(alias.filePath) ?? context.readFile(alias.filePath)?.split(/\r?\n/) ?? [])
+    .slice(alias.startLine - 1, alias.endLine);
+  if (lines.length === 0) return false;
+  lines[lines.length - 1] = lines[lines.length - 1]!.slice(0, alias.endColumn);
+  const text = stripCommentsForRegex(lines.join('\n').slice(alias.startColumn), 'typescript');
+  let depth = 0;
+  let equals = -1;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '<') depth++;
+    else if (text[i] === '>' && text[i - 1] !== '=') depth--;
+    else if (text[i] === '=' && text[i + 1] !== '>' && depth === 0) {
+      equals = i;
+      break;
+    }
+  }
+  if (equals < 0) return false;
+  const value = text.slice(equals + 1).trim().replace(/;\s*$/, '').trim();
+  if (!value.startsWith('{')) return false;
+  const close = jsCloseOf(value, 0);
+  return close >= 0 && value.slice(close + 1).trim() === '';
 }
 
 /**
@@ -26848,14 +27100,21 @@ function tsStaticReturnedType(cls: Node, name: string, at: UnresolvedRef, contex
   const head = lines.slice(method.startLine - 1, method.startLine + 2).join('\n');
   const written = head.match(new RegExp(`(?<![\\w$.])${escapeRegExp(name)}\\s*([<(])`, 'g')) ?? [];
   if (written.length !== 1 || written[0]!.endsWith('<')) return null;
-  const signature = stripCommentsForRegex(method.signature ?? '', 'typescript').trim();
+  const owner = context.getNodesInFile(method.filePath).find((n) => n.kind === 'class' && n.startLine <= method.startLine && n.endLine >= method.endLine);
+  return tsDeclaredMemberReturn(method, owner, stripCommentsForRegex(method.signature ?? '', 'typescript').trim(), ':', context);
+}
+
+function tsDeclaredMemberReturn(
+  method: Node, owner: Node | undefined, signature: string, separator: ':' | '=>', context: ResolutionContext,
+): TsTypeRead | null {
   const close = signature.startsWith('(') ? jsCloseOf(signature, 0) : -1;
-  const annotation = close < 0 ? undefined : /^\s*:\s*([\s\S]*\S)\s*$/.exec(signature.slice(close + 1))?.[1];
+  if (close < 0) return null;
+  const tail = signature.slice(close + 1).trimStart();
+  const annotation = tail.startsWith(separator) ? tail.slice(separator.length).trim() : undefined;
   if (annotation === undefined || /^(?:asserts\b|(?:this|[A-Za-z_$][\w$]*)\s+is\b)/.test(annotation) || tsHidesMembers(annotation, context)) return null;
   const raw = new RegExp(`^${TS_ANNOTATED_TYPE}`).exec(annotation)?.[1];
   if (!raw || raw.endsWith(']') || !tsOneType(annotation, raw) || raw === 'this') return null;
-  const owner = context.getNodesInFile(method.filePath).find((n) => n.kind === 'class' && n.startLine <= method.startLine && n.endLine >= method.endLine);
-  if (owner && tsClassTypeParameter(owner, raw.split(/[.<\s]/)[0]!, context)) return null;
+  if (owner && [...annotation.matchAll(/[A-Za-z_$][\w$]*/g)].some((match) => tsClassTypeParameter(owner, match[0], context))) return null;
   return { raw, file: method.filePath, language: method.language, line: method.startLine, from: [method.filePath] };
 }
 
@@ -27409,7 +27668,10 @@ function matchPythonElementCall(ref: UnresolvedRef, context: ResolutionContext):
 export function matchMethodCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   const read: { from?: string[] } = {};
   const hit = matchMethodCallOn(ref, context, read);
-  return read.from ? withTypeFrom(hit, read.from) : hit;
+  const typed = read.from ? withTypeFrom(hit, read.from) : hit;
+  return typed && ref.instanceTypeOwner
+    ? { ...typed, metadata: { ...typed.metadata, instanceTypeOwner: ref.instanceTypeOwner } }
+    : typed;
 }
 
 /** `readers`: whether the TS/JS binding readers (jsReceiverReadElsewhere, jsNarrowedReading) type the receiver. */

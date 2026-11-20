@@ -23,6 +23,7 @@ import {
 } from './types';
 import { cargoManifestFields, isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustCallUnreachable, isRustTraitImplMember, isRustOtherTypesMethod, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoBuiltinReceiverCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonFunctionModuleAlias, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, crossesWorkspaceRoot, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
 import { isPythonImportStatementModule } from './name-matcher';
+import { tsRelatedInstanceTypeNames } from './name-matcher';
 import { isJsThisCall } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
@@ -69,6 +70,7 @@ import { aliasConfigFields, loadProjectAliases, type AliasMap } from './path-ali
 import { findGoModuleForImport, goModulePackageDir, loadGoModule, type GoModule } from './go-module';
 import { loadWorkspacePackagesAndManifests, workspaceFingerprint, workspacePackageDirOf, type ManifestDiscovery, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
+import { instanceTypeOwnerTail } from '../db/reference-tail';
 import { stripCommentsForRegex } from './strip-comments';
 import { lexicalPathWithinRoot } from '../utils';
 import type { CrossFileNodes, ReExport } from './types';
@@ -619,6 +621,11 @@ export class ReferenceResolver {
       ? getAllFrameworkResolvers().filter((f) => frameworks.includes(f.name))
       : detectFrameworks(this.context);
     this.frameworksByLanguage.clear();
+  }
+
+  /** Names a TypeScript import or export rename can connect to these owners. */
+  relatedInstanceTypeNames(names: readonly string[]): string[] {
+    return tsRelatedInstanceTypeNames(names, this.context);
   }
 
   /** The detected frameworks whose `resolve()` reads a reference written in `language`. */
@@ -2430,7 +2437,8 @@ export class ReferenceResolver {
    */
   private parkable(ref: UnresolvedRef): UnresolvedRef {
     const read = this.lastResolved?.ref === ref ? this.lastResolved.context : this.context;
-    const tail = importBindingTail(ref, this.context, read);
+    const pending = ref.instanceTypePending ?? (ref.instanceTypeMerged ? ref.instanceTypeOwner : undefined);
+    const tail = pending ? instanceTypeOwnerTail(pending) : importBindingTail(ref, this.context, read);
     if (tail) ref.nameTail = tail;
     return ref;
   }
