@@ -34,7 +34,7 @@ import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
 import { logWarn } from './errors';
 import { QueryBuilder, type DeprioritizedPathMatcher } from './db/queries';
-import { importPathKeys, moduleReferenceKeys } from './db/reference-tail';
+import { importPathKeys, instanceTypeOwnerTail, moduleReferenceKeys } from './db/reference-tail';
 import {
   isInitialized,
   createDirectory,
@@ -61,6 +61,7 @@ import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
 import { minRefsForPool } from './resolution/resolver-pool';
+import { stripCommentsForRegex } from './resolution/strip-comments';
 
 // Re-export types for consumers
 export * from './types';
@@ -1258,9 +1259,17 @@ export class CodeGraph {
         const watchRoutes = this.resolver.hasNavigationRouters();
         let routesBefore = null as Node[] | null;
         const flowChange = this.resolver.trackParameterFlows();
+        const instanceOwnersBefore = new Set<string>();
+        let instanceAliasesMayChange = false;
         const result = await this.orchestrator.sync(options.onProgress, options.paths, backpressure,
           (filePath, content) => {
             flowChange.before(filePath);
+            if (/\.[cm]?tsx?$/.test(filePath)) {
+              for (const name of this.queries.getNodeNamesByFiles([filePath], ['class', 'interface'])) instanceOwnersBefore.add(name);
+              if (content !== undefined && /\b(?:import|export)\s+(?:type\s+)?\{[^{}]*\bas\b[^{}]*\}/.test(stripCommentsForRegex(content, 'typescript'))) {
+                instanceAliasesMayChange = true;
+              }
+            }
             if (watchRoutes && routesBefore === null) routesBefore = this.queries.getNodesByKind('route');
             if (!refreshSynthesis && (this.queries.hasSynthesizedEdgesTouchingFile(filePath) ||
               this.queries.wasSynthesisInput(filePath) ||
@@ -1868,10 +1877,21 @@ export class CodeGraph {
           if (touched.length > 0) {
             const tTypes = Date.now();
             const reopenedFiles = this.orchestrator.resurrectTypeDependentEdges(touched, result.changedFilePaths ?? []);
+            const tsChanged = (result.changedFilePaths ?? []).filter((p) => /\.[cm]?tsx?$/.test(p));
+            const tsTouched = touched.some((p) => /\.[cm]?tsx?$/.test(p));
+            const names = [...new Set([...instanceOwnersBefore, ...this.queries.getNodeNamesByFiles(tsChanged, ['class', 'interface'])])];
+            const owners = names.length > 0 ? this.resolver.relatedInstanceTypeNames(names) : names;
+            const ownerFiles = this.orchestrator.resurrectInstanceTypeEdges(instanceAliasesMayChange ? null : owners, result.changedFilePaths ?? []);
+            const failedOwnerKeys = tsTouched ? this.queries.getFailedInstanceTypeOwnerKeys() : [];
+            const ownerRefs = this.queries.getRetryableFailedReferences(
+              [...new Set([...owners.map(instanceTypeOwnerTail), ...failedOwnerKeys])], Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER
+            );
+            this.queries.reopenFailedReferences(ownerRefs.flatMap((ref) => ref.rowId === undefined ? [] : [ref.rowId]));
             // CODEGRAPH_PY_ATTR_RETRY_CEILING overrides the candidate ceiling (tests).
             const ceiling = Number(process.env.CODEGRAPH_PY_ATTR_RETRY_CEILING ?? '') || 2000;
             const failed = touchedPy.length > 0 ? this.resolver.pythonAttrRetryCandidates(touchedPy, ceiling) : [];
-            const retry = [...this.queries.getUnresolvedReferencesByFiles(reopenedFiles), ...(failed ?? [])];
+            const retryFiles = [...new Set([...reopenedFiles, ...ownerFiles, ...ownerRefs.flatMap((ref) => ref.filePath ? [ref.filePath] : [])])];
+            const retry = [...this.queries.getUnresolvedReferencesByFiles(retryFiles), ...(failed ?? [])];
             if (retry.length > 0) await this.resolver.resolveAndPersistListYielding(retry);
             if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
               console.error(

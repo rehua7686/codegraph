@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- TypeScript calls on locals returned by instance methods or function properties, including imported factory-created values, now link to the right method while ambiguous declarations remain unresolved (#3422).
 
 ## [1.6.4] - 2026-11-20
 
